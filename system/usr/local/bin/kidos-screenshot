@@ -1,0 +1,18 @@
+#!/bin/sh
+# kidos-screenshot — region (default), full screen, or window. Saves to ~/Pictures/Screenshots,
+# copies to the clipboard and shows a notification so you know it worked.
+#   kidos-screenshot [region|full|window]
+dir="${XDG_PICTURES_DIR:-$HOME/Pictures}/Screenshots"
+mkdir -p "$dir"
+file="$dir/$(date +%Y-%m-%d_%H-%M-%S).png"
+
+case "${1:-region}" in
+  full)   grim "$file" ;;
+  window) geo=$(swaymsg -t get_tree | jq -r '.. | select(.focused? == true) | .rect | "\(.x),\(.y) \(.width)x\(.height)"')
+          grim -g "$geo" "$file" ;;
+  *)      geo=$(slurp -d -b 14161b88 -c 7aa2f7ff) || exit 0   # Esc cancels
+          grim -g "$geo" "$file" ;;
+esac || { notify-send -a KidOS "Screenshot failed" "grim could not capture the screen"; exit 1; }
+
+wl-copy < "$file"
+notify-send -a KidOS -i "$file" "Screenshot saved" "Copied to clipboard · ${file#"$HOME"/}"

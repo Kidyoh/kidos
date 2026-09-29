@@ -38,7 +38,7 @@ k "Super + R"            "resize mode (Esc to leave)"
 echo
 echo "${B}Tools${N}"
 k "Super + Ctrl + V"     "clipboard history"
-k "Super + Shift + S"    "screenshot area to clipboard"
+k "Super + P"            "screenshot an area (Print = full screen)"
 k "Super + G"            "machine history (kidos log)"
 k "Super + Esc"          "lock screen"
 k "Super + /"            "this cheatsheet"

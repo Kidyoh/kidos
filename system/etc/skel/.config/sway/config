@@ -46,8 +46,6 @@ bindsym $mod+w      kill
 bindsym $mod+f      fullscreen toggle
 bindsym $mod+t      floating toggle
 bindsym $mod+Escape exec swaylock -f -c 14161b
-bindsym $mod+Shift+s exec grim -g "$(slurp)" - | wl-copy
-bindsym Print        exec grim ~/screenshot-$(date +%s).png
 bindsym $mod+Shift+r reload
 bindsym $mod+Shift+e exec swaynag -t warning -m 'Leave KidOS?' -B 'Log out' 'swaymsg exit'
 
