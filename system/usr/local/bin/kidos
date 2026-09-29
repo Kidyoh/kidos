@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# kidos — git-style version control for the whole machine.
+#
+# The root filesystem is the "repo", btrfs snapshots are the "commits",
+# snapper does the bookkeeping. Every pacman transaction auto-commits (snap-pac).
+set -euo pipefail
+
+VERSION=0.1.0
+CFG=root
+SNAPDIR=/.snapshots
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B='' D='' R='' G='' Y='' C='' N=''
+fi
+die()  { printf '%skidos:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+snap() { snapper --no-dbus -c "$CFG" "$@"; }
+confirm() { [[ -n ${KIDOS_YES:-} ]] && return; local a; read -rp "$1 [y/N] " a; [[ $a == [yY]* ]] || die "aborted"; }
+
+usage() {
+  cat <<EOF
+${B}kidos${N} $VERSION — version control for your whole OS
+
+  ${B}kidos status${N}                  what changed since the last snapshot
+  ${B}kidos commit -m "msg"${N}         snapshot the system now
+  ${B}kidos log${N} [-n N] [--json]     history (commits + automatic pacman snapshots)
+  ${B}kidos show${N} REF                one snapshot: details + packages it changed
+  ${B}kidos diff${N} [A] [B] [--pkgs]   compare two points (default: HEAD vs current)
+  ${B}kidos tag${N} REF NAME            name a snapshot, e.g. kidos tag 12 stable
+  ${B}kidos restore${N} REF PATH...     bring files back as they were at REF
+  ${B}kidos rollback${N} REF            make the whole OS = REF (reboot to apply)
+  ${B}kidos gc${N}                      clean old snapshots and pre-rollback leftovers
+
+REF = snapshot number | HEAD | HEAD~N | tag name | current
+Temporary checkout: pick "KidOS snapshots" in the boot menu (read-only boot).
+EOF
+}
+
+# ------------------------------------------------------------ helpers
+list() { snap --jsonout list | jq --arg c "$CFG" '.[$c]'; }
+
+resolve() {
+  local ref=${1:-HEAD} n k
+  case $ref in
+    HEAD|head|last)  n=$(list | jq -r '[.[]|select(.number>0)] | last | .number // empty') ;;
+    HEAD~*|head~*)   k=${ref#*~}; [[ $k =~ ^[0-9]+$ ]] || die "bad ref: $ref"
+                     n=$(list | jq -r --argjson k "$k" \
+                       '[.[]|select(.number>0)] | if $k < length then .[length-1-$k].number else empty end') ;;
+    current|0)       n=0 ;;
+    *[!0-9]*)        n=$(list | jq -r --arg t "$ref" '[.[]|select(.userdata.tag? == $t)] | last | .number // empty') ;;
+    *)               n=$(list | jq -r --argjson x "$ref" '.[]|select(.number==$x)|.number') ;;
+  esac
+  [[ -n $n ]] || die "unknown ref: $ref"
+  echo "$n"
+}
+
+root_of() { [[ $1 == 0 ]] && echo "" || echo "$SNAPDIR/$1/snapshot"; }
+
+pkgs_at() { pacman -Q --dbpath "$(root_of "$1")/var/lib/pacman" 2>/dev/null | LC_ALL=C sort; }
+
+pkg_diff() { # A B -> lines "+ name ver" / "- name ver" / "~ name old -> new"
+  LC_ALL=C join -a1 -a2 -e '-' -o 0,1.2,2.2 <(pkgs_at "$1") <(pkgs_at "$2") |
+    awk '$2!=$3 { if ($2=="-") print "+ "$1" "$3; else if ($3=="-") print "- "$1" "$2; else print "~ "$1" "$2" -> "$3 }'
+}
+
+paint() { # colorize +/-/~ and snapper status lines
+  while IFS= read -r l; do
+    case ${l:0:1} in
+      +) printf '%s%s%s\n' "$G" "$l" "$N" ;;
+      -) printf '%s%s%s\n' "$R" "$l" "$N" ;;
+      *) printf '%s%s%s\n' "$Y" "$l" "$N" ;;
+    esac
+  done
+}
+
+meta() { list | jq -r --argjson n "$1" '.[]|select(.number==$n)'; }
+
+# ------------------------------------------------------------ commands
+cmd_status() {
+  local head changes pk
+  head=$(resolve HEAD)
+  printf 'On snapshot %s%s%s: %s\n' "$C" "$head" "$N" "$(meta "$head" | jq -r .description)"
+  pk=$(pkg_diff "$head" 0)
+  changes=$(snap status "$head..0" 2>/dev/null | grep -Ev ' /(\.snapshots|var/lib/systemd|var/tmp|root/\.cache)' || true)
+  if [[ -z $pk && -z $changes ]]; then echo "Nothing changed. System is clean."; return; fi
+  [[ -n $pk ]] && { echo; echo "${B}Packages:${N}"; paint <<<"$pk"; }
+  if [[ -n $changes ]]; then
+    echo; echo "${B}Files:${N} $(wc -l <<<"$changes") changed"
+    head -n 25 <<<"$changes" | paint
+    (( $(wc -l <<<"$changes") > 25 )) && echo "${D}... see all: kidos diff${N}"
+  fi
+  echo; echo "${D}Save this state:  kidos commit -m \"what you did\"${N}"
+}
+
+cmd_commit() {
+  local msg="" n
+  while (($#)); do
+    case $1 in
+      -m) msg=${2:-}; shift 2 || shift ;;
+      *)  msg="$*"; break ;;
+    esac
+  done
+  [[ -n $msg ]] || die 'usage: kidos commit -m "message"'
+  n=$(snap create --print-number --cleanup-algorithm number --description "$msg" --userdata "kidos=commit")
+  printf '[%s%s%s] %s\n' "$C" "$n" "$N" "$msg"
+}
+
+cmd_log() {
+  local limit=0 json=0
+  while (($#)); do
+    case $1 in
+      --json) json=1; shift ;;
+      -n) limit=${2:?}; shift 2 ;;
+      *) die "log: unknown option $1" ;;
+    esac
+  done
+  if ((json)); then list; return; fi
+  list | jq -r --argjson lim "$limit" '
+      [.[] | select(.number>0)] | reverse | (if $lim>0 then .[:$lim] else . end) | .[] |
+      [ (.number|tostring), .date,
+        (if .userdata.kidos? == "commit" then "commit" elif .type=="single" then "manual" else "auto:"+.type end),
+        (.userdata.tag? // ""), .description ] | join("\u001f")' |
+  while IFS=$'\x1f' read -r num date kind tag desc; do
+    local col=$D; [[ $kind == commit ]] && col=$Y
+    printf '%s%5s%s  %s%s%s  %s%-11s%s %s' "$col" "$num" "$N" "$D" "$date" "$N" "$col" "$kind" "$N" "$desc"
+    [[ -n $tag ]] && printf '  %s(tag: %s)%s' "$G" "$tag" "$N"
+    echo
+  done
+}
+
+cmd_show() {
+  local n m prev
+  n=$(resolve "${1:-HEAD}")
+  [[ $n != 0 ]] || die "show: pick a snapshot, not 'current'"
+  m=$(meta "$n")
+  jq -r '"snapshot \(.number)\nDate:   \(.date)\nType:   \(.type)\nUser:   \(.user)\n\n    \(.description)\n"' <<<"$m"
+  # compare with the pre-snapshot for pacman pairs, else the previous snapshot
+  prev=$(jq -r '."pre-number" // empty' <<<"$m")
+  [[ -z $prev ]] && prev=$(list | jq -r --argjson n "$n" '[.[]|select(.number>0 and .number<$n)] | last | .number // empty')
+  if [[ -n $prev ]]; then
+    local d; d=$(pkg_diff "$prev" "$n")
+    echo "${B}Packages vs $prev:${N}"; if [[ -n $d ]]; then paint <<<"$d"; else echo "  (none)"; fi
+  fi
+}
+
+cmd_diff() {
+  local pkgs=0 args=() a b d
+  for x in "$@"; do if [[ $x == --pkgs ]]; then pkgs=1; else args+=("$x"); fi; done
+  a=$(resolve "${args[0]:-HEAD}"); b=$(resolve "${args[1]:-current}")
+  echo "${B}diff $a..$b${N}"
+  d=$(pkg_diff "$a" "$b")
+  echo "${B}Packages:${N}"; if [[ -n $d ]]; then paint <<<"$d"; else echo "  (none)"; fi
+  ((pkgs)) && return
+  echo "${B}Files:${N}"
+  snap status "$a..$b" | paint
+}
+
+cmd_tag() {
+  local n; n=$(resolve "${1:?usage: kidos tag REF NAME}")
+  [[ ${2:-} =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]] || die "tag name must start with a letter (letters, digits, . _ -)"
+  snap modify --userdata "tag=$2,important=yes" "$n"
+  echo "tagged $n as $2"
+}
+
+cmd_restore() {
+  local n; n=$(resolve "${1:?usage: kidos restore REF PATH...}"); shift
+  (($#)) || die "usage: kidos restore REF PATH..."
+  local p abs=()
+  for p in "$@"; do abs+=("$(realpath -m "$p")"); done
+  echo "Restore to their state at snapshot $n:"; printf '  %s\n' "${abs[@]}"
+  confirm "Continue?"
+  snap undochange "$n..0" "${abs[@]}"
+}
+
+top_mount() { # mount the btrfs top level (subvolid=5), print mountpoint
+  local dev t
+  dev=$(findmnt -no SOURCE / | sed 's/\[.*\]$//')
+  t=$(mktemp -d /run/kidos-top.XXXX)
+  mount -o subvolid=5 "$dev" "$t"
+  echo "$t"
+}
+
+cmd_rollback() {
+  local n safety t stamp
+  n=$(resolve "${1:?usage: kidos rollback REF}")
+  [[ $n != 0 ]] || die "rollback: pick a snapshot"
+  [[ $(findmnt -no FSROOT /) == /@ ]] || die "root is not @ (booted into a snapshot?). Boot normally, then run: kidos rollback $n"
+  echo "Snapshot $n: $(meta "$n" | jq -r .description)"
+  confirm "Replace the running OS with snapshot $n? (/home is not touched)"
+  safety=$(snap create --print-number --cleanup-algorithm number \
+    --description "before rollback to $n" --userdata "kidos=commit,important=yes")
+  t=$(top_mount)
+  trap 'umount "$t" 2>/dev/null; rmdir "$t" 2>/dev/null' EXIT
+  stamp=$(date +%Y%m%d-%H%M%S)
+  btrfs subvolume snapshot "$t/@snapshots/$n/snapshot" "$t/@new" >/dev/null
+  mv "$t/@" "$t/@old-$stamp"
+  mv "$t/@new" "$t/@"
+  echo "${G}Done.${N} Reboot to run snapshot $n."
+  echo "Undo: kidos rollback $safety   (old root kept as @old-$stamp until 'kidos gc')"
+}
+
+cmd_gc() {
+  local t olds
+  snap cleanup number
+  t=$(top_mount)
+  trap 'umount "$t" 2>/dev/null; rmdir "$t" 2>/dev/null' EXIT
+  mapfile -t olds < <(find "$t" -maxdepth 1 -name '@old-*' -printf '%f\n' | sort)
+  if ((${#olds[@]})); then
+    printf 'Leftover roots from rollbacks:\n'; printf '  %s\n' "${olds[@]}"
+    confirm "Delete them?"
+    for o in "${olds[@]}"; do btrfs subvolume delete "$t/$o" >/dev/null; echo "deleted $o"; done
+  fi
+  echo "gc done."
+}
+
+# ------------------------------------------------------------ main
+cmd=${1:-help}; shift || true
+case $cmd in
+  help|-h|--help) usage; exit 0 ;;
+  version|--version) echo "kidos $VERSION"; exit 0 ;;
+esac
+[[ $EUID -eq 0 ]] || exec sudo -- "$0" "$cmd" "$@"
+command -v snapper >/dev/null || die "snapper not installed"
+case $cmd in
+  status|st)  cmd_status "$@" ;;
+  commit|ci)  cmd_commit "$@" ;;
+  log)        cmd_log "$@" ;;
+  show)       cmd_show "$@" ;;
+  diff)       cmd_diff "$@" ;;
+  tag)        cmd_tag "$@" ;;
+  restore)    cmd_restore "$@" ;;
+  rollback)   cmd_rollback "$@" ;;
+  gc)         cmd_gc "$@" ;;
+  *) usage; die "unknown command: $cmd" ;;
+esac

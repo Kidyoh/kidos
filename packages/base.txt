@@ -1,0 +1,46 @@
+# Packages pacstrapped onto an installed KidOS system.
+# Rule: every line must earn its RAM/disk. Old PCs are the target.
+# (linux-firmware and CPU microcode are added by the installer only on real hardware.)
+
+# --- core
+base
+linux
+btrfs-progs
+sudo
+networkmanager
+zram-generator
+man-db
+bash-completion
+
+# --- boot + machine versioning (git-style history of the whole OS)
+grub
+efibootmgr
+grub-btrfs
+inotify-tools
+snapper
+jq
+
+# --- dev basics
+git
+neovim
+
+# --- desktop: Sway (Wayland tiling, ~150MB idle)
+sway
+swaybg
+swayidle
+swaylock
+foot
+fuzzel
+mako
+grim
+slurp
+wl-clipboard
+brightnessctl
+polkit
+xdg-desktop-portal-wlr
+ttf-jetbrains-mono
+
+# --- audio
+pipewire
+pipewire-pulse
+wireplumber

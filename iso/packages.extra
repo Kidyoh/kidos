@@ -1,0 +1,5 @@
+# Extra packages for the KidOS live ISO (merged into Arch's releng list).
+# The installer mostly needs what releng already ships (btrfs-progs, gptfdisk,
+# arch-install-scripts, dosfstools). Keep this list tiny.
+git
+jq

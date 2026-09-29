@@ -1,0 +1,175 @@
+#!/usr/bin/env bash
+# kidos-install — install KidOS onto a disk. THE TARGET DISK IS WIPED.
+#
+# Interactive by default. Every prompt can be pre-answered with an env var,
+# so an agent or script can install unattended:
+#   KIDOS_DISK=/dev/vda KIDOS_USER=kidus KIDOS_PASS=secret KIDOS_YES=1 kidos-install
+#
+# Also runs from a git checkout on the plain Arch ISO (no custom ISO needed):
+#   KIDOS_PAYLOAD=$PWD ./iso/airootfs/usr/local/bin/kidos-install
+set -euo pipefail
+
+PAYLOAD=${KIDOS_PAYLOAD:-/usr/share/kidos}
+MNT=/mnt
+OPTS=noatime,compress=zstd:3,space_cache=v2
+
+B=$'\e[1m' G=$'\e[32m' R=$'\e[31m' N=$'\e[0m'
+step() { printf '\n%s==>%s %s%s%s\n' "$G" "$N" "$B" "$*" "$N"; }
+die()  { printf '%skidos-install:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+ask()  { # ask VAR "prompt" [default] [secret]
+  local __v=$1 __p=$2 __d=${3:-} __s=${4:-} __a
+  if [[ -n ${!__v:-} ]]; then return; fi
+  if [[ -n $__s ]]; then read -rsp "$__p: " __a; echo; else read -rp "$__p${__d:+ [$__d]}: " __a; fi
+  printf -v "$__v" '%s' "${__a:-$__d}"
+}
+
+[[ $EUID -eq 0 ]] || die "run as root"
+[[ -f $PAYLOAD/packages/base.txt && -d $PAYLOAD/system ]] || die "payload not found at $PAYLOAD (set KIDOS_PAYLOAD)"
+ping -c1 -W3 archlinux.org >/dev/null 2>&1 || die "no internet (in a VM, use NAT networking)"
+
+VIRT=$(systemd-detect-virt || true)
+UEFI=0; [[ -d /sys/firmware/efi/efivars ]] && UEFI=1
+
+# ---------------------------------------------------------------- questions
+echo "${B}KidOS installer${N}  (firmware: $([[ $UEFI == 1 ]] && echo UEFI || echo BIOS), machine: ${VIRT})"
+echo; lsblk -dpno NAME,SIZE,MODEL | grep -Ev 'loop|/dev/sr|zram' || true; echo
+
+DISK=${KIDOS_DISK:-};         ask DISK "Install to disk (e.g. /dev/vda, /dev/sda, /dev/nvme0n1)"
+HOSTNAME_=${KIDOS_HOST:-};    ask HOSTNAME_ "Hostname" kidos
+USERNAME=${KIDOS_USER:-};     ask USERNAME "Username"
+TIMEZONE=${KIDOS_TZ:-};       ask TIMEZONE "Timezone" "Africa/Addis_Ababa"
+AUTOLOGIN=${KIDOS_AUTOLOGIN:-}; ask AUTOLOGIN "Auto-login to desktop on boot? (y/n)" y
+PASS=${KIDOS_PASS:-}
+if [[ -z $PASS ]]; then
+  ask PASS "Password (user + root)" "" secret; ask PASS2 "Repeat password" "" secret
+  [[ $PASS == "${PASS2:-}" ]] || die "passwords do not match"
+fi
+
+[[ -b $DISK ]] || die "$DISK is not a block device"
+[[ $USERNAME =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || die "invalid username '$USERNAME'"
+[[ -n $PASS ]] || die "empty password"
+[[ -f /usr/share/zoneinfo/$TIMEZONE ]] || die "unknown timezone '$TIMEZONE'"
+
+if [[ -z ${KIDOS_YES:-} ]]; then
+  CONFIRM=""; ask CONFIRM "${R}ALL DATA on $DISK will be destroyed.${N} Type YES to continue"
+  [[ $CONFIRM == YES ]] || die "aborted"
+fi
+
+# ---------------------------------------------------------------- disk
+step "Partitioning $DISK"
+umount -R "$MNT" 2>/dev/null || true
+wipefs -af "$DISK" >/dev/null
+sgdisk -Z "$DISK" >/dev/null
+if [[ $UEFI == 1 ]]; then
+  sgdisk -n1:0:+512M -t1:ef00 -c1:EFI -n2:0:0 -t2:8300 -c2:KIDOS "$DISK" >/dev/null
+else
+  sgdisk -n1:0:+1M -t1:ef02 -c1:BIOSBOOT -n2:0:0 -t2:8300 -c2:KIDOS "$DISK" >/dev/null
+fi
+partprobe "$DISK" 2>/dev/null || true
+udevadm settle
+part() { if [[ $DISK =~ [0-9]$ ]]; then echo "${DISK}p$1"; else echo "${DISK}$1"; fi; }
+P1=$(part 1); P2=$(part 2)
+
+step "Creating btrfs + subvolumes"
+mkfs.btrfs -f -L kidos "$P2" >/dev/null
+[[ $UEFI == 1 ]] && mkfs.fat -F32 -n EFI "$P1" >/dev/null
+mount "$P2" "$MNT"
+#   @           /                     <- versioned (this is "the repo")
+#   @home       /home                 <- your files, not rolled back with the OS
+#   @snapshots  /.snapshots           <- history ("the .git folder")
+#   @log, @pkg  /var/log, pacman cache <- excluded from history to keep it small
+for sv in @ @home @snapshots @log @pkg; do btrfs subvolume create "$MNT/$sv" >/dev/null; done
+umount "$MNT"
+mount -o "$OPTS,subvol=@" "$P2" "$MNT"
+mkdir -p "$MNT"/{home,.snapshots,var/log,var/cache/pacman/pkg}
+mount -o "$OPTS,subvol=@home"      "$P2" "$MNT/home"
+mount -o "$OPTS,subvol=@snapshots" "$P2" "$MNT/.snapshots"
+mount -o "$OPTS,subvol=@log"       "$P2" "$MNT/var/log"
+mount -o "$OPTS,subvol=@pkg"       "$P2" "$MNT/var/cache/pacman/pkg"
+if [[ $UEFI == 1 ]]; then mkdir -p "$MNT/efi"; mount "$P1" "$MNT/efi"; fi
+
+# ---------------------------------------------------------------- packages
+step "Installing packages"
+mapfile -t PKGS < <(grep -Ev '^\s*(#|$)' "$PAYLOAD/packages/base.txt")
+if [[ $VIRT == none ]]; then
+  PKGS+=(linux-firmware)
+  grep -q GenuineIntel /proc/cpuinfo && PKGS+=(intel-ucode)
+  grep -q AuthenticAMD /proc/cpuinfo && PKGS+=(amd-ucode)
+fi
+pacstrap -K "$MNT" "${PKGS[@]}"
+
+# fstab: drop subvolid= so a rolled-back @ (new id, same name) still mounts
+genfstab -U "$MNT" | sed -E 's/,?subvolid=[0-9]+//' >> "$MNT/etc/fstab"
+
+step "Copying KidOS system files"
+cp -a "$PAYLOAD/system/." "$MNT/"
+chmod 755 "$MNT"/usr/local/bin/*
+
+# ---------------------------------------------------------------- configure
+step "Configuring system"
+printf '%s:%s\n' root "$PASS" > "$MNT/root/.pw"
+printf '%s:%s\n' "$USERNAME" "$PASS" >> "$MNT/root/.pw"
+arch-chroot "$MNT" /bin/bash -e <<CHROOT
+ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
+hwclock --systohc || true
+sed -i 's/^#en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
+locale-gen >/dev/null
+echo LANG=en_US.UTF-8 > /etc/locale.conf
+echo $HOSTNAME_ > /etc/hostname
+printf '127.0.0.1 localhost\n::1 localhost\n127.0.1.1 %s\n' $HOSTNAME_ > /etc/hosts
+
+useradd -m -G wheel,video,input -s /bin/bash $USERNAME
+chpasswd < /root/.pw && rm -f /root/.pw
+echo '%wheel ALL=(ALL:ALL) ALL' > /etc/sudoers.d/10-wheel
+chmod 440 /etc/sudoers.d/10-wheel
+
+systemctl enable NetworkManager systemd-timesyncd >/dev/null 2>&1
+CHROOT
+
+if [[ $AUTOLOGIN == [yY]* ]]; then
+  mkdir -p "$MNT/etc/systemd/system/getty@tty1.service.d"
+  cat > "$MNT/etc/systemd/system/getty@tty1.service.d/autologin.conf" <<EOF
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -f -- \\\\u' --noclear --autologin $USERNAME %I \$TERM
+EOF
+fi
+
+# ---------------------------------------------------------------- bootloader
+step "Installing GRUB"
+sed -i \
+  -e 's/^GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="KidOS"/' \
+  -e 's/^GRUB_TIMEOUT=.*/GRUB_TIMEOUT=2/' \
+  -e 's/^GRUB_CMDLINE_LINUX_DEFAULT=.*/GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 quiet"/' \
+  "$MNT/etc/default/grub"
+if [[ $UEFI == 1 ]]; then
+  arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/efi --bootloader-id=KidOS
+  # fallback path too: some VMs (VirtualBox) forget NVRAM boot entries
+  arch-chroot "$MNT" grub-install --target=x86_64-efi --efi-directory=/efi --removable
+else
+  arch-chroot "$MNT" grub-install --target=i386-pc "$DISK"
+fi
+
+# ---------------------------------------------------------------- history
+step "Setting up machine history (snapper)"
+# snapper insists on creating /.snapshots itself; swap in our @snapshots subvolume after
+umount "$MNT/.snapshots"
+rmdir "$MNT/.snapshots"
+arch-chroot "$MNT" snapper --no-dbus -c root create-config /
+btrfs subvolume delete "$MNT/.snapshots" >/dev/null
+mkdir "$MNT/.snapshots"
+mount -o "$OPTS,subvol=@snapshots" "$P2" "$MNT/.snapshots"
+chmod 750 "$MNT/.snapshots"
+arch-chroot "$MNT" snapper --no-dbus -c root set-config \
+  TIMELINE_CREATE=no NUMBER_LIMIT=30 NUMBER_LIMIT_IMPORTANT=10 \
+  ALLOW_GROUPS=wheel SYNC_ACL=yes
+# snap-pac = automatic pre/post snapshot around every pacman transaction
+arch-chroot "$MNT" pacman -S --noconfirm --needed snap-pac >/dev/null
+arch-chroot "$MNT" systemctl enable grub-btrfsd snapper-cleanup.timer >/dev/null 2>&1
+arch-chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
+arch-chroot "$MNT" snapper --no-dbus -c root create --cleanup-algorithm number \
+  --description "initial install" --userdata "kidos=commit,tag=install,important=yes"
+
+umount -R "$MNT"
+step "KidOS is installed."
+echo "Remove the ISO and reboot. First thing to try after login:  kidos log"

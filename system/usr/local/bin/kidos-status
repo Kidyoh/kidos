@@ -1,0 +1,17 @@
+#!/bin/sh
+# kidos-status — swaybar status line. Pure shell + /proc, wakes every 10s.
+while :; do
+    mem=$(awk '/^MemTotal/{t=$2} /^MemAvailable/{a=$2} END{printf "%dM", (t-a)/1024}' /proc/meminfo)
+    load=$(cut -d' ' -f1 /proc/loadavg)
+    bat=""
+    for b in /sys/class/power_supply/BAT*; do
+        [ -r "$b/capacity" ] && bat="  bat $(cat "$b/capacity")%"
+    done
+    net=""
+    for i in /sys/class/net/*; do
+        [ "${i##*/}" = lo ] && continue
+        [ "$(cat "$i/operstate" 2>/dev/null)" = up ] && net="  net ${i##*/}"
+    done
+    printf 'mem %s  load %s%s%s   %s \n' "$mem" "$load" "$net" "$bat" "$(date '+%a %d %b  %H:%M')"
+    sleep 10
+done
