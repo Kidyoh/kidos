@@ -32,10 +32,10 @@ setup() {
   echo "  5) Other OpenAI-compatible API"
   read -rp "Provider [1]: " choice
   case ${choice:-1} in
-    1) fmt=openai;    base=https://generativelanguage.googleapis.com/v1beta/openai; model=gemini-2.5-flash ;;
+    1) fmt=openai;    base=https://generativelanguage.googleapis.com/v1beta/openai; model=gemini-3.8-flash ;;
     2) fmt=anthropic; base=https://api.anthropic.com;  model=claude-haiku-4-5 ;;
     3) fmt=openai;    base=https://api.openai.com/v1;  model=gpt-4.1-mini ;;
-    4) fmt=openai;    base=https://openrouter.ai/api/v1; model=google/gemini-2.5-flash ;;
+    4) fmt=openai;    base=https://openrouter.ai/api/v1; model=openrouter/auto ;;
     5) fmt=openai;    read -rp "Base URL (…/v1): " base; model="" ;;
     *) die "invalid choice" ;;
   esac
