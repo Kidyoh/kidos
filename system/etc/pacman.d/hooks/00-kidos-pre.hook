@@ -1,0 +1,13 @@
+# KidOS: snapshot the system before every pacman transaction (replaces snap-pac, no Python needed)
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = *
+
+[Action]
+Description = kidos: saving snapshot before changes...
+When = PreTransaction
+Exec = /usr/local/bin/kidos _hook pre
+NeedsTargets

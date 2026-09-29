@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# kidos-menu — the KidOS system menu (fuzzel in dmenu mode). Super+Alt+Space.
+#   kidos-menu                 main menu
+#   kidos-menu clipboard       clipboard history (Super+Ctrl+V)
+#   kidos-menu nightlight      toggle night light
+#   kidos-menu nightlight --restore   re-enable at login if it was on
+set -uo pipefail
+
+CFG=${XDG_CONFIG_HOME:-$HOME/.config}/kidos
+mkdir -p "$CFG"
+
+pick() { fuzzel --dmenu --prompt "$1 › " "${@:2}"; }
+term() { foot --app-id=kidos-float -e bash -c "$1; echo; read -rsn1 -p 'Press any key to close'"; }
+note() { notify-send -a KidOS "$1" "${2:-}" 2>/dev/null || true; }
+need() { # need <binary> <package>: offer to install on first use
+  command -v "$1" >/dev/null && return 0
+  [[ $(printf 'Install %s\nCancel\n' "$2" | pick "$2 is not installed") == Install* ]] || return 1
+  term "sudo pacman -S --needed --noconfirm $2"
+  command -v "$1" >/dev/null
+}
+
+wifi() {
+  local list ssid sec pass
+  nmcli radio wifi on >/dev/null 2>&1
+  list=$(nmcli -t -f IN-USE,SIGNAL,SECURITY,SSID dev wifi list --rescan yes 2>/dev/null |
+         awk -F: '$4!="" {printf "%s %3s%%  %-6s  %s\n", ($1=="*"?"●":"○"), $2, ($3==""?"open":"lock"), $4}' | sort -u -k4)
+  [[ -n $list ]] || { note "Wi-Fi" "No networks found (or no Wi-Fi adapter)."; return; }
+  ssid=$(printf '%s\nDisconnect\n' "$list" | pick "wifi") || return
+  [[ $ssid == Disconnect ]] && { nmcli dev disconnect "$(nmcli -t -f DEVICE,TYPE dev | awk -F: '$2=="wifi"{print $1; exit}')"; return; }
+  sec=$(awk '{print $3}' <<<"$ssid"); ssid=$(sed -E 's/^[^ ]+ +[0-9]+%  [a-z]+ +//' <<<"$ssid")
+  if nmcli -t -f NAME con show | grep -Fxq "$ssid"; then
+    nmcli con up id "$ssid" && note "Wi-Fi" "Connected to $ssid" || note "Wi-Fi" "Failed to connect"
+  elif [[ $sec == lock ]]; then
+    pass=$(pick "password for $ssid" --password </dev/null) || return
+    nmcli dev wifi connect "$ssid" password "$pass" && note "Wi-Fi" "Connected to $ssid" || note "Wi-Fi" "Wrong password?"
+  else
+    nmcli dev wifi connect "$ssid" && note "Wi-Fi" "Connected to $ssid"
+  fi
+}
+
+bluetooth() {
+  need bluetoothctl bluez-utils || return
+  if ! systemctl is-active -q bluetooth; then
+    term "sudo pacman -S --needed --noconfirm bluez && sudo systemctl enable --now bluetooth"
+  fi
+  bluetoothctl power on >/dev/null
+  local choice mac
+  choice=$(printf 'Scan for devices (10s)\n%s\nTurn Bluetooth off\n' \
+           "$(bluetoothctl devices | cut -d' ' -f2-)" | pick "bluetooth") || return
+  case $choice in
+    Scan*) note "Bluetooth" "Scanning…"; timeout 10 bluetoothctl scan on >/dev/null; bluetooth ;;
+    Turn*) bluetoothctl power off >/dev/null ;;
+    *) mac=${choice%% *}
+       bluetoothctl pair "$mac" >/dev/null 2>&1; bluetoothctl trust "$mac" >/dev/null
+       bluetoothctl connect "$mac" && note "Bluetooth" "Connected ${choice#* }" || note "Bluetooth" "Could not connect" ;;
+  esac
+}
+
+audio() {
+  local choice sink
+  choice=$(printf 'Volume 25%%\nVolume 50%%\nVolume 75%%\nVolume 100%%\nMute / unmute\n%s\n' \
+           "$(pactl list short sinks 2>/dev/null | awk '{print "Output: "$2}')" | pick "sound") || return
+  case $choice in
+    Volume*) sink=${choice#Volume }; wpctl set-volume @DEFAULT_AUDIO_SINK@ "${sink%\%}%" ;;
+    Mute*)   wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle ;;
+    Output*) pactl set-default-sink "${choice#Output: }" && note "Sound" "Output: ${choice#Output: }" ;;
+  esac
+}
+
+clipboard() {
+  need cliphist cliphist || return
+  cliphist list | pick "clipboard" | cliphist decode | wl-copy
+}
+
+nightlight() {
+  need wlsunset wlsunset || return
+  if [[ ${1:-} == --restore ]]; then
+    [[ -e $CFG/nightlight ]] && { wlsunset -S 06:30 -s 18:30 -t 3800 >/dev/null 2>&1 & }
+    return
+  fi
+  if pkill -x wlsunset; then rm -f "$CFG/nightlight"; note "Night light" "Off"
+  else touch "$CFG/nightlight"; wlsunset -S 06:30 -s 18:30 -t 3800 >/dev/null 2>&1 & disown; note "Night light" "On (warm after sunset)"
+  fi
+}
+
+apps() { # curated, Wayland-friendly, light where possible
+  local choice pkg
+  choice=$(cat <<'EOF' | pick "install"
+Firefox — web browser|firefox
+Chromium — web browser|chromium
+Code - OSS — code editor|code
+Telegram — messaging|telegram-desktop
+mpv — video player (light)|mpv
+imv — image viewer (light)|imv
+Zathura — PDF reader (light)|zathura zathura-pdf-mupdf
+LibreOffice — office suite (heavy)|libreoffice-fresh
+Thunar — file manager|thunar
+btop — system monitor|btop
+Enable X11 apps (Xwayland, +~40MB RAM)|xorg-xwayland
+EOF
+  ) || return
+  pkg=${choice#*|}; choice=${choice%|*}
+  [[ $pkg == "$choice" ]] && return
+  term "echo 'Installing ${choice%% —*}…'; sudo pacman -S --needed --noconfirm $pkg"
+  if [[ $pkg == xorg-xwayland ]]; then
+    sed -i 's/^xwayland disable/xwayland enable/' "$HOME/.config/sway/config" 2>/dev/null
+    note "Xwayland" "Installed. Log out and back in to use X11 apps."
+  fi
+}
+
+power() {
+  local choice
+  choice=$(printf 'Lock\nSuspend\nLog out\nReboot\nShut down\n' | pick "power") || return
+  case $choice in
+    Lock)       swaylock -f -c 14161b ;;
+    Suspend)    systemctl suspend ;;
+    "Log out")  swaymsg exit ;;
+    Reboot)     systemctl reboot ;;
+    "Shut down") systemctl poweroff ;;
+  esac
+}
+
+main() {
+  local choice
+  choice=$(printf '%s\n' \
+    "  Ask KidOS" "  Wi-Fi" "  Bluetooth" "  Sound" "  Clipboard history" "  Night light" \
+    "  Install apps" "  Update KidOS" "  Machine history" "  Keybindings" "  Power" |
+    pick "kidos") || exit 0
+  case ${choice#  } in
+    "Ask KidOS")        foot --app-id=kidos-float -e kidos ask ;;
+    Wi-Fi)              wifi ;;
+    Bluetooth)          bluetooth ;;
+    Sound)              audio ;;
+    "Clipboard history") clipboard ;;
+    "Night light")      nightlight ;;
+    "Install apps")     apps ;;
+    "Update KidOS")     term "kidos update" ;;
+    "Machine history")  term "kidos log -n 40" ;;
+    Keybindings)        kidos-welcome --window ;;
+    Power)              power ;;
+  esac
+}
+
+case ${1:-} in
+  clipboard)  clipboard ;;
+  nightlight) nightlight "${2:-}" ;;
+  wifi)       wifi ;;
+  power)      power ;;
+  *)          main ;;
+esac

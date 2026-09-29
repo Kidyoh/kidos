@@ -104,6 +104,12 @@ genfstab -U "$MNT" | sed -E 's/,?subvolid=[0-9]+//' >> "$MNT/etc/fstab"
 step "Copying KidOS system files"
 cp -a "$PAYLOAD/system/." "$MNT/"
 chmod 755 "$MNT"/usr/local/bin/*
+arch-chroot "$MNT" /usr/local/bin/kidos brand --no-grub >/dev/null
+# remember where KidOS came from so `kidos update` works out of the box
+mkdir -p "$MNT/etc/kidos"
+REPO=${KIDOS_REPO:-$(git -C "$PAYLOAD" remote get-url origin 2>/dev/null || cat "$PAYLOAD/repo" 2>/dev/null || true)}
+[[ -n $REPO ]] && printf 'REPO=%q\n' "$REPO" > "$MNT/etc/kidos/kidos.conf"
+{ git -C "$PAYLOAD" rev-parse HEAD 2>/dev/null || cat "$PAYLOAD/version" 2>/dev/null; } > "$MNT/etc/kidos/version" || true
 
 # ---------------------------------------------------------------- configure
 step "Configuring system"
@@ -163,8 +169,8 @@ chmod 750 "$MNT/.snapshots"
 arch-chroot "$MNT" snapper --no-dbus -c root set-config \
   TIMELINE_CREATE=no NUMBER_LIMIT=30 NUMBER_LIMIT_IMPORTANT=10 \
   ALLOW_GROUPS=wheel SYNC_ACL=yes
-# snap-pac = automatic pre/post snapshot around every pacman transaction
-arch-chroot "$MNT" pacman -S --noconfirm --needed snap-pac >/dev/null
+# automatic pre/post snapshots come from /etc/pacman.d/hooks/*kidos* (copied with system/)
+chmod 440 "$MNT/etc/sudoers.d/20-kidos"
 arch-chroot "$MNT" systemctl enable grub-btrfsd snapper-cleanup.timer >/dev/null 2>&1
 arch-chroot "$MNT" grub-mkconfig -o /boot/grub/grub.cfg
 arch-chroot "$MNT" snapper --no-dbus -c root create --cleanup-algorithm number \

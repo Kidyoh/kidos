@@ -31,6 +31,8 @@ cp -a "$HERE/iso/airootfs/." "$P/airootfs/"
 # 3. Payload the installer copies onto the target disk
 mkdir -p "$P/airootfs/usr/share/kidos"
 cp -a "$HERE/system" "$HERE/packages" "$P/airootfs/usr/share/kidos/"
+git -C "$HERE" remote get-url origin > "$P/airootfs/usr/share/kidos/repo" 2>/dev/null || true
+git -C "$HERE" rev-parse HEAD > "$P/airootfs/usr/share/kidos/version" 2>/dev/null || true
 
 # 4. Branding + executable bits (mkarchiso resets file modes)
 sed -i \

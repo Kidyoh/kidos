@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# kidos-welcome — keybinding cheatsheet. Opens by itself on first login; Super+/ anytime.
+#   kidos-welcome --first-run   open a window only if never shown before
+#   kidos-welcome --window      open in a floating terminal
+#   kidos-welcome               print here
+STATE=${XDG_STATE_HOME:-$HOME/.local/state}/kidos/welcomed
+
+case ${1:-} in
+  --first-run)
+    [[ -e $STATE ]] && exit 0
+    mkdir -p "$(dirname "$STATE")" && touch "$STATE"
+    exec foot --app-id=kidos-welcome -e "$0" --pause ;;
+  --window)
+    exec foot --app-id=kidos-welcome -e "$0" --pause ;;
+esac
+
+B=$'\e[1m' D=$'\e[2m' C=$'\e[34m' N=$'\e[0m'
+k() { printf '  %s%-22s%s %s\n' "$C" "$1" "$N" "$2"; }
+
+printf '%s' "$C$B"
+cat /usr/share/kidos/logo.txt 2>/dev/null | sed 's/\$1//g'
+printf '%s\n' "$N"
+echo "${B}Welcome to KidOS.${N} Everything is a keystroke away. ${D}(Super = Windows key)${N}"
+echo
+echo "${B}Apps${N}"
+k "Super + Enter"        "terminal"
+k "Super + Space"        "launch an app"
+k "Super + Alt + Space"  "KidOS menu: Wi-Fi, sound, Bluetooth, apps, power"
+k "Super + A"            "ask KidOS (AI assistant)"
+k "Super + W"            "close window"
+echo
+echo "${B}Windows${N}"
+k "Super + H J K L"      "move focus (arrows work too)"
+k "Super + Shift + HJKL" "move window"
+k "Super + 1..9"         "switch workspace (Shift = send window there)"
+k "Super + F / T"        "fullscreen / floating"
+k "Super + R"            "resize mode (Esc to leave)"
+echo
+echo "${B}Tools${N}"
+k "Super + Ctrl + V"     "clipboard history"
+k "Super + Shift + S"    "screenshot area to clipboard"
+k "Super + G"            "machine history (kidos log)"
+k "Super + Esc"          "lock screen"
+k "Super + /"            "this cheatsheet"
+echo
+echo "${B}Your OS has undo${N}"
+echo "  Every install and update is snapshotted.  ${C}kidos log${N}  shows history,"
+echo "  ${C}kidos rollback N${N}  takes the whole system back.  ${C}kidos update${N}  keeps it current."
+echo
+
+if [[ ${1:-} == --pause ]]; then
+  read -rsn1 -p "${D}Press any key to close${N}"
+fi

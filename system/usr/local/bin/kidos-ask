@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+# kidos-ask — talk to your OS in plain language.
+#
+#   kidos ask "install a browser"      one task
+#   kidos ask                          chat mode
+#   kidos ask --setup                  pick provider + API key
+#
+# The model proposes shell commands; you approve each one (read-only commands
+# run automatically). The whole session is wrapped in a snapshot pair, so
+# anything it changed can be undone with `kidos rollback`.
+# Needs only bash, curl and jq.
+set -uo pipefail
+
+CONF=${XDG_CONFIG_HOME:-$HOME/.config}/kidos/ask.conf
+MAX_STEPS=15
+
+if [[ -t 1 ]]; then
+  B=$'\e[1m' D=$'\e[2m' R=$'\e[31m' G=$'\e[32m' Y=$'\e[33m' C=$'\e[36m' N=$'\e[0m'
+else
+  B='' D='' R='' G='' Y='' C='' N=''
+fi
+die() { printf '%skidos ask:%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
+
+# ------------------------------------------------------------ setup
+setup() {
+  local choice key model fmt base
+  echo "${B}kidos ask setup${N}"
+  echo "  1) Gemini      (free tier available)"
+  echo "  2) Claude      (Anthropic)"
+  echo "  3) OpenAI"
+  echo "  4) OpenRouter  (any model, one key)"
+  echo "  5) Other OpenAI-compatible API"
+  read -rp "Provider [1]: " choice
+  case ${choice:-1} in
+    1) fmt=openai;    base=https://generativelanguage.googleapis.com/v1beta/openai; model=gemini-2.5-flash ;;
+    2) fmt=anthropic; base=https://api.anthropic.com;  model=claude-haiku-4-5 ;;
+    3) fmt=openai;    base=https://api.openai.com/v1;  model=gpt-4.1-mini ;;
+    4) fmt=openai;    base=https://openrouter.ai/api/v1; model=google/gemini-2.5-flash ;;
+    5) fmt=openai;    read -rp "Base URL (…/v1): " base; model="" ;;
+    *) die "invalid choice" ;;
+  esac
+  read -rp "Model [${model}]: " m; model=${m:-$model}
+  [[ -n $model ]] || die "model required"
+  read -rsp "API key: " key; echo
+  [[ -n $key ]] || die "API key required"
+  mkdir -p "$(dirname "$CONF")"
+  ( umask 077
+    { printf 'ASK_FORMAT=%q\n' "$fmt"; printf 'ASK_BASE=%q\n' "$base"
+      printf 'ASK_MODEL=%q\n' "$model"; printf 'ASK_KEY=%q\n' "$key"; } > "$CONF" )
+  echo "${G}Saved${N} to $CONF. Try:  kidos ask \"how much RAM am I using?\""
+}
+
+# ------------------------------------------------------------ safety
+# Read-only commands run without asking. Anything else needs a "y".
+is_safe() {
+  local cmd=$1 seg w rest
+  [[ $cmd == *[\;\&\>\<\`]* || $cmd == *'$('* || $cmd == *$'\n'* ]] && return 1
+  IFS='|' read -ra segs <<<"$cmd"
+  for seg in "${segs[@]}"; do
+    read -r w rest <<<"$seg"
+    case $w in
+      ls|cat|head|tail|grep|free|df|du|uname|uptime|whoami|id|hostname|lsblk|lscpu|lspci|lsusb|\
+      ps|pgrep|date|which|file|stat|wc|sort|uniq|echo|fastfetch|ip|sensors|journalctl|awk|cut|tr) ;;
+      pacman)    [[ $rest =~ ^-(Q|Ss|Si|F)[a-z]*( |$) ]] || return 1 ;;
+      systemctl) [[ $rest =~ ^(--user\ )?(status|is-active|is-enabled|is-failed|list-units|list-unit-files|--failed|show)( |$) ]] || return 1 ;;
+      nmcli)     [[ $rest =~ (connect|delete|modify|up|down|add|radio|off|on|disconnect|reload) ]] && return 1 ;;
+      swaymsg)   [[ $rest =~ ^-t\ get_ ]] || return 1 ;;
+      wpctl)     [[ $rest =~ ^(status|inspect|get-volume) ]] || return 1 ;;
+      pactl)     [[ $rest =~ ^(list|info|get-) ]] || return 1 ;;
+      find)      [[ $rest =~ -(delete|exec|execdir|ok|fprint) ]] && return 1 ;;
+      kidos)     [[ $rest =~ ^(log|status|st|show|diff)( |$) ]] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+
+# ------------------------------------------------------------ model plumbing
+TOOL_DESC='Run a bash command on this KidOS machine as the current user (use sudo for root). Output (stdout+stderr, truncated) and exit code are returned.'
+TOOL_SCHEMA='{"type":"object","properties":{"command":{"type":"string","description":"bash command, non-interactive"},"reason":{"type":"string","description":"one short line: why"}},"required":["command","reason"]}'
+
+MSGS='[]'
+TEXT='' CALLS=''
+
+post_json() { # url body -> response (API key passed via header file, not argv)
+  local hdr; hdr=$(mktemp); chmod 600 "$hdr"
+  if [[ $ASK_FORMAT == anthropic ]]; then
+    printf 'x-api-key: %s\nanthropic-version: 2023-06-01\n' "$ASK_KEY" > "$hdr"
+  else
+    printf 'Authorization: Bearer %s\n' "$ASK_KEY" > "$hdr"
+  fi
+  curl -sS --max-time 180 "$1" -H @"$hdr" -H 'content-type: application/json' -d @- <<<"$2"
+  local rc=$?; rm -f "$hdr"; return $rc
+}
+
+call_model() {
+  local body resp err
+  if [[ $ASK_FORMAT == anthropic ]]; then
+    body=$(jq -n --arg m "$ASK_MODEL" --arg s "$SYS" --argjson msgs "$MSGS" \
+      --arg d "$TOOL_DESC" --argjson sch "$TOOL_SCHEMA" \
+      '{model:$m, max_tokens:2048, system:$s, messages:$msgs,
+        tools:[{name:"run_command", description:$d, input_schema:$sch}]}')
+    resp=$(post_json "${ASK_BASE%/}/v1/messages" "$body") || { echo "network error" >&2; return 1; }
+    err=$(jq -r '.error.message // empty' <<<"$resp" 2>/dev/null)
+    [[ -z $err ]] || { echo "API error: $err" >&2; return 1; }
+    jq -e '.content' >/dev/null 2>&1 <<<"$resp" || { echo "bad response: ${resp:0:300}" >&2; return 1; }
+    MSGS=$(jq -c --argjson c "$(jq -c .content <<<"$resp")" '. + [{role:"assistant", content:$c}]' <<<"$MSGS")
+    TEXT=$(jq -r '[.content[] | select(.type=="text") | .text] | join("\n")' <<<"$resp")
+    CALLS=$(jq -c '.content[] | select(.type=="tool_use") | {id, input}' <<<"$resp")
+  else
+    body=$(jq -n --arg m "$ASK_MODEL" --arg s "$SYS" --argjson msgs "$MSGS" \
+      --arg d "$TOOL_DESC" --argjson sch "$TOOL_SCHEMA" \
+      '{model:$m, messages:([{role:"system", content:$s}] + $msgs),
+        tools:[{type:"function", function:{name:"run_command", description:$d, parameters:$sch}}]}')
+    resp=$(post_json "${ASK_BASE%/}/chat/completions" "$body") || { echo "network error" >&2; return 1; }
+    err=$(jq -r 'if type=="array" then .[0].error.message else .error.message end // empty' <<<"$resp" 2>/dev/null)
+    [[ -z $err ]] || { echo "API error: $err" >&2; return 1; }
+    jq -e '.choices[0].message' >/dev/null 2>&1 <<<"$resp" || { echo "bad response: ${resp:0:300}" >&2; return 1; }
+    local msg; msg=$(jq -c '.choices[0].message | {role:"assistant", content:(.content // ""), tool_calls} | if .tool_calls == null then del(.tool_calls) else . end' <<<"$resp")
+    MSGS=$(jq -c --argjson m "$msg" '. + [$m]' <<<"$MSGS")
+    TEXT=$(jq -r '.content // ""' <<<"$msg")
+    CALLS=$(jq -c '.tool_calls[]? | {id, input:(.function.arguments | fromjson? // {})}' <<<"$msg")
+  fi
+}
+
+add_user() { MSGS=$(jq -c --arg t "$1" '. + [{role:"user", content:$t}]' <<<"$MSGS"); }
+
+add_results() { # JSON array of {id,out}
+  if [[ $ASK_FORMAT == anthropic ]]; then
+    MSGS=$(jq -c --argjson r "$1" '. + [{role:"user", content:[$r[] | {type:"tool_result", tool_use_id:.id, content:.out}]}]' <<<"$MSGS")
+  else
+    MSGS=$(jq -c --argjson r "$1" '. + [$r[] | {role:"tool", tool_call_id:.id, content:.out}]' <<<"$MSGS")
+  fi
+}
+
+# ------------------------------------------------------------ running commands
+PRE=''   # snapshot number taken before the first approved change
+QUESTION=''
+
+snapshot_pre() {
+  [[ -n $PRE ]] && return
+  PRE=$(sudo kidos _snap pre "ask: ${QUESTION:0:60}" 2>/dev/null) || PRE=''
+}
+snapshot_post() {
+  [[ -n $PRE ]] || return 0
+  sudo kidos _snap post "$PRE" "ask: ${QUESTION:0:60}" >/dev/null 2>&1 &&
+    echo "${D}kidos: session saved as snapshots $PRE+ — undo everything with: kidos rollback $PRE${N}"
+  PRE=''
+}
+trap snapshot_post EXIT
+
+run_one() { # command reason -> sets OUT
+  local cmd=$1 reason=$2 a="" tmp rc
+  printf '\n%s›%s %s\n  %s$ %s%s\n' "$C" "$N" "$reason" "$B" "$cmd" "$N"
+  if is_safe "$cmd"; then
+    printf '  %s(read-only, running)%s\n' "$D" "$N"
+  else
+    read -rp "  run it? [y/N/e=edit] " a </dev/tty 2>/dev/null || a=""
+    case $a in
+      e|E) read -rei "$cmd" -p "  \$ " cmd </dev/tty ;;
+      y|Y|yes) ;;
+      *) OUT="The user declined to run this command."; echo "  ${D}skipped${N}"; return ;;
+    esac
+    snapshot_pre
+  fi
+  tmp=$(mktemp)
+  timeout 600 bash -c "$cmd" </dev/null 2>&1 | tee "$tmp" | sed -u "s/^/  ${D}│${N} /"
+  rc=${PIPESTATUS[0]}
+  ((rc == 124)) && echo "  ${Y}(timed out after 10 min)${N}"
+  OUT="exit code: $rc
+$(tail -c 6000 "$tmp")"
+  rm -f "$tmp"
+}
+
+ask_once() {
+  local step c id cmd reason results
+  QUESTION=${QUESTION:-$1}
+  add_user "$1"
+  for ((step = 0; step < MAX_STEPS; step++)); do
+    [[ -t 1 ]] && printf '%sthinking…%s' "$D" "$N"
+    call_model; local ok=$?
+    [[ -t 1 ]] && printf '\r\e[K'
+    ((ok == 0)) || return 1
+    [[ -n ${TEXT//[[:space:]]/} ]] && printf '%s%s%s\n' "$G" "$TEXT" "$N"
+    [[ -z $CALLS ]] && return 0
+    results='[]'
+    while IFS= read -r c; do
+      id=$(jq -r .id <<<"$c")
+      cmd=$(jq -r '.input.command // empty' <<<"$c")
+      reason=$(jq -r '.input.reason // "no reason given"' <<<"$c")
+      if [[ -z $cmd ]]; then OUT="error: missing command"; else run_one "$cmd" "$reason"; fi
+      results=$(jq -c --arg id "$id" --arg o "$OUT" '. + [{id:$id, out:$o}]' <<<"$results")
+    done <<<"$CALLS"
+    add_results "$results"
+  done
+  echo "${Y}Stopped after $MAX_STEPS steps.${N}"
+}
+
+# ------------------------------------------------------------ main
+[[ ${1:-} == --setup ]] && { setup; exit; }
+[[ $EUID -ne 0 ]] || die "run as your normal user; commands that need root use sudo"
+command -v jq >/dev/null && command -v curl >/dev/null || die "needs curl and jq"
+# shellcheck source=/dev/null
+[[ -f $CONF ]] && . "$CONF"
+if [[ -z ${ASK_KEY:-} ]]; then
+  echo "No AI provider set up yet."; setup
+  # shellcheck source=/dev/null
+  . "$CONF"
+fi
+
+SYS="You are the assistant built into KidOS, a lightweight Arch Linux based OS for old PCs.
+Desktop: Sway (Wayland, Xwayland off by default), terminal foot, launcher fuzzel, audio PipeWire (wpctl/pactl), network NetworkManager (nmcli), packages pacman (no AUR helper).
+The root filesystem is btrfs; the whole OS is versioned by the 'kidos' CLI (kidos log/diff/show/rollback/restore). This session is snapshotted, so changes can be undone.
+You act only through the run_command tool; the user approves each command.
+Rules: commands must be non-interactive (pacman --noconfirm, systemctl --no-pager, no editors or pagers). Keep output small (head, tail, grep). Check before changing things. Prefer small, light packages; this OS targets old hardware.
+Style: short and plain. No filler. When finished, give a 1-3 line summary of what changed.
+Machine: $(hostname), kernel $(uname -r), RAM used $(free -h | awk '/^Mem/{print $3" of "$2}'), disk / $(df -h / | awk 'NR==2{print $3" of "$2}'), user $USER."
+
+if (($#)); then
+  ask_once "$*"
+else
+  echo "${B}kidos ask${N} ${D}($ASK_MODEL) — empty line or 'exit' to quit${N}"
+  while read -rep "${C}ask ›${N} " q; do
+    [[ -z $q || $q == exit || $q == quit ]] && break
+    history -s "$q"
+    ask_once "$q"
+  done
+fi

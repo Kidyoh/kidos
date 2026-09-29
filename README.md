@@ -6,6 +6,28 @@ A lightweight, keyboard-first Linux OS for old PCs, where **the whole machine ha
 - **Desktop:** Sway (Wayland tiling), built-in bar, no Xwayland by default
 - **History:** btrfs + snapper, driven by the `kidos` command. Every package install auto-snapshots
 - **Lean by default:** zram swap, capped journal, solid-colour wallpaper, no firmware blobs inside VMs
+- **Agent-native:** `kidos ask` lets an AI run your machine, with your approval, and every session is undoable
+- **Self-updating:** `kidos update` pulls the latest KidOS from GitHub plus all package updates as one snapshot
+
+## kidos ask
+
+```
+kidos ask --setup                     pick Gemini (free tier) / Claude / OpenAI / OpenRouter, paste API key
+kidos ask "why is my RAM so high"     one task
+kidos ask                             chat mode   (or Super+A)
+```
+
+The model proposes shell commands. Read-only ones (`free`, `pacman -Q`, `journalctl`…) run straight away;
+anything that changes the system waits for your `y` (or `e` to edit it first). The session is wrapped in a
+snapshot pair, so `kidos rollback N` undoes everything it did. Pure bash + curl + jq, no extra RAM when idle.
+
+## kidos update
+
+```
+kidos update --repo https://github.com/<you>/kidos   once (the installer sets this automatically)
+kidos update                                         KidOS files + pacman -Syu + new packages, one snapshot pair
+kidos update --check                                 just show what's new
+```
 
 ## The `kidos` command
 
@@ -19,6 +41,9 @@ kidos tag 12 stable          name a snapshot
 kidos restore 12 /etc/foo    bring files back as they were at 12
 kidos rollback stable        make the whole OS = that snapshot, reboot to apply
 kidos gc                     clean up
+kidos ask "..."              ask the OS to do something (AI)
+kidos update                 update KidOS + packages, undoable
+kidos brand                  re-apply KidOS identity (os-release, GRUB colours)
 ```
 
 Refs work like git: a number, `HEAD`, `HEAD~2`, a tag name, or `current`.
@@ -73,6 +98,11 @@ KIDOS_DISK=/dev/vda KIDOS_USER=kidus KIDOS_PASS=changeme KIDOS_YES=1 kidos-insta
 | `Super+F` / `Super+T` | fullscreen / floating |
 | `Super+H/J/K/L` | focus (Shift = move) |
 | `Super+1..9` | workspaces (Shift = send window) |
+| `Super+Alt+Space` | KidOS menu: Wi-Fi, Bluetooth, sound, apps, night light, power |
+| `Super+A` | ask KidOS (AI) |
+| `Super+Ctrl+V` | clipboard history |
+| `Super+N` | night light on/off |
+| `Super+/` | keybinding cheatsheet |
 | `Super+G` | machine history (`kidos log`) |
 | `Super+Shift+S` | screenshot region to clipboard |
 | `Super+Esc` | lock |

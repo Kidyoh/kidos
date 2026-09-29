@@ -1,0 +1,8 @@
+NAME="KidOS"
+PRETTY_NAME="KidOS"
+ID=kidos
+ID_LIKE=arch
+BUILD_ID=rolling
+ANSI_COLOR="38;2;122;162;247"
+HOME_URL="https://kidus-yohannes.engineer"
+LOGO=kidos

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://github.com/fastfetch-cli/fastfetch/raw/dev/doc/json_schema.json",
+  "logo": {
+    "type": "file",
+    "source": "/usr/share/kidos/logo.txt",
+    "color": { "1": "blue" },
+    "padding": { "top": 1, "right": 3 }
+  },
+  "display": { "separator": "  " },
+  "modules": [
+    "title", "separator",
+    "os", "kernel", "uptime", "packages", "shell", "wm", "terminal",
+    "cpu", "memory", "disk",
+    { "type": "command", "key": "Snapshots", "text": "ls /.snapshots 2>/dev/null | wc -l" },
+    "break", "colors"
+  ]
+}

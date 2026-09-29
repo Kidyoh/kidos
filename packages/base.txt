@@ -39,6 +39,11 @@ brightnessctl
 polkit
 xdg-desktop-portal-wlr
 ttf-jetbrains-mono
+fastfetch
+cliphist
+wlsunset
+libnotify
+libpulse
 
 # --- audio
 pipewire

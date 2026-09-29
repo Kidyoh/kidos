@@ -5,7 +5,7 @@
 # snapper does the bookkeeping. Every pacman transaction auto-commits (snap-pac).
 set -euo pipefail
 
-VERSION=0.1.0
+VERSION=0.2.0
 CFG=root
 SNAPDIR=/.snapshots
 
@@ -31,6 +31,9 @@ ${B}kidos${N} $VERSION — version control for your whole OS
   ${B}kidos restore${N} REF PATH...     bring files back as they were at REF
   ${B}kidos rollback${N} REF            make the whole OS = REF (reboot to apply)
   ${B}kidos gc${N}                      clean old snapshots and pre-rollback leftovers
+
+  ${B}kidos ask${N} ["task"]            ask your OS to do something (AI, you approve each command)
+  ${B}kidos update${N} [--check]        update KidOS + all packages, as one undoable snapshot
 
 REF = snapshot number | HEAD | HEAD~N | tag name | current
 Temporary checkout: pick "KidOS snapshots" in the boot menu (read-only boot).
@@ -119,7 +122,7 @@ cmd_log() {
   list | jq -r --argjson lim "$limit" '
       [.[] | select(.number>0)] | reverse | (if $lim>0 then .[:$lim] else . end) | .[] |
       [ (.number|tostring), .date,
-        (if .userdata.kidos? == "commit" then "commit" elif .type=="single" then "manual" else "auto:"+.type end),
+        (if .userdata.kidos? == "commit" then "commit" elif .type=="single" then "snapshot" else "auto:"+.type end),
         (.userdata.tag? // ""), .description ] | join("\u001f")' |
   while IFS=$'\x1f' read -r num date kind tag desc; do
     local col=$D; [[ $kind == commit ]] && col=$Y
@@ -200,6 +203,33 @@ cmd_rollback() {
   echo "Undo: kidos rollback $safety   (old root kept as @old-$stamp until 'kidos gc')"
 }
 
+cmd_hook() { # called by /etc/pacman.d/hooks/*kidos*.hook — never let a snapshot failure break pacman
+  local phase=${1:-} state=/run/kidos-pacman-pre desc targets n
+  mapfile -t targets || true
+  [[ -n ${KIDOS_NO_HOOK:-} ]] && return 0   # kidos update takes its own snapshot pair
+  desc=$(tr '\0' ' ' < "/proc/$PPID/cmdline" 2>/dev/null || true)
+  [[ $desc == *pacman* ]] || desc="pacman ${targets[*]}"
+  desc=${desc% }; ((${#desc} > 80)) && desc="${desc:0:77}..."
+  case $phase in
+    pre)
+      n=$(snap create --type pre --print-number --cleanup-algorithm number \
+            --description "$desc" 2>/dev/null) && echo "$n" > "$state" \
+        || echo "kidos: warning: pre-snapshot failed" >&2 ;;
+    post)
+      if [[ -s $state ]]; then
+        local pre; pre=$(<"$state")
+        n=$(snap create --type post --pre-number "$pre" --print-number \
+              --cleanup-algorithm number --description "$desc" 2>/dev/null) || n=""
+        rm -f "$state"
+        [[ -n $n ]] && echo "kidos: saved snapshots — undo with: kidos rollback $pre" \
+          || echo "kidos: warning: post-snapshot failed" >&2
+      fi
+      # a 'filesystem' package upgrade resets /etc/os-release to Arch's; put KidOS back
+      [[ -L /etc/os-release ]] && cmd_brand --no-grub >/dev/null 2>&1 ;;
+  esac
+  return 0
+}
+
 cmd_gc() {
   local t olds
   snap cleanup number
@@ -214,23 +244,126 @@ cmd_gc() {
   echo "gc done."
 }
 
+cmd_snap() { # internal, used by kidos-ask: _snap pre DESC | _snap post PRE DESC
+  case ${1:-} in
+    pre)  snap create --type pre --print-number --cleanup-algorithm number --description "${2:-kidos}" ;;
+    post) snap create --type post --pre-number "${2:?}" --print-number --cleanup-algorithm number --description "${3:-kidos}" ;;
+    *) die "_snap pre|post" ;;
+  esac
+}
+
+cmd_brand() { # (re)apply KidOS identity: os-release, console banner, GRUB colours
+  local nogrub=0 changed=0
+  [[ ${1:-} == --no-grub ]] && nogrub=1
+  if ! cmp -s /usr/share/kidos/os-release /etc/os-release 2>/dev/null || [[ -L /etc/os-release ]]; then
+    rm -f /etc/os-release; cp /usr/share/kidos/os-release /etc/os-release
+  fi
+  cmp -s /usr/share/kidos/issue /etc/issue 2>/dev/null || cp /usr/share/kidos/issue /etc/issue
+  if [[ -f /etc/default/grub ]]; then
+    local g=/etc/default/grub before; before=$(md5sum < "$g")
+    sed -i -e 's/^#\?GRUB_DISTRIBUTOR=.*/GRUB_DISTRIBUTOR="KidOS"/' \
+           -e '/^#\?GRUB_COLOR_NORMAL=/d' -e '/^#\?GRUB_COLOR_HIGHLIGHT=/d' "$g"
+    printf 'GRUB_COLOR_NORMAL="light-gray/black"\nGRUB_COLOR_HIGHLIGHT="light-blue/black"\n' >> "$g"
+    [[ $(md5sum < "$g") != "$before" ]] && changed=1
+    if ((changed && !nogrub)) && [[ -d /boot/grub ]]; then grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1; fi
+  fi
+  echo "KidOS branding applied."
+}
+
+cmd_update() {
+  local conf=/etc/kidos/kidos.conf src=/var/lib/kidos/src check=0 system=1 REPO="" old new pre post u home
+  while (($#)); do
+    case $1 in
+      --check) check=1; shift ;;
+      --no-system) system=0; shift ;;
+      --repo) mkdir -p /etc/kidos; printf 'REPO=%q\n' "${2:?--repo URL}" > "$conf"; shift 2 ;;
+      *) die "update: unknown option $1 (use --check, --repo URL, --no-system)" ;;
+    esac
+  done
+  # shellcheck source=/dev/null
+  [[ -f $conf ]] && . "$conf"
+  [[ -n $REPO ]] || die "no KidOS repo set. Run once:  kidos update --repo https://github.com/<you>/kidos"
+
+  echo "${B}Fetching KidOS from${N} $REPO"
+  if [[ -d $src/.git ]]; then
+    git -C "$src" remote set-url origin "$REPO"
+    git -C "$src" fetch -q --depth 50 origin || die "fetch failed"
+    git -C "$src" reset -q --hard FETCH_HEAD
+  else
+    rm -rf "$src"; mkdir -p "$(dirname "$src")"
+    git clone -q --depth 50 "$REPO" "$src" || die "clone failed"
+  fi
+  old=$(cat /etc/kidos/version 2>/dev/null || true)
+  new=$(git -C "$src" rev-parse HEAD)
+  if [[ $old == "$new" ]]; then
+    echo "KidOS is up to date (${new:0:7})."
+  else
+    echo "${B}KidOS changes:${N}"
+    if [[ -n $old ]] && git -C "$src" cat-file -e "$old" 2>/dev/null; then
+      git -C "$src" log --oneline "$old..$new" | sed 's/^/  /'
+    else
+      git -C "$src" log --oneline -5 | sed 's/^/  /'
+    fi
+  fi
+  ((check)) && { ((system)) && { echo; echo "${B}Package updates:${N}"; checkupdates 2>/dev/null || pacman -Qu 2>/dev/null || true; }; return; }
+
+  pre=$(snap create --type pre --print-number --cleanup-algorithm number --description "kidos update")
+  export KIDOS_NO_HOOK=1
+
+  # 1. KidOS files (--remove-destination: never rewrite a running script in place)
+  cp -a --remove-destination --no-preserve=ownership "$src/system/." /
+  chmod 755 /usr/local/bin/kidos*
+  chmod 440 /etc/sudoers.d/*kidos* 2>/dev/null || true
+
+  # 2. packages: full upgrade + anything new in the KidOS package list
+  local pkgs; mapfile -t pkgs < <(grep -Ev '^\s*(#|$)' "$src/packages/base.txt")
+  if ((system)); then
+    pacman -Syu --needed --noconfirm "${pkgs[@]}"
+  else
+    pacman -S --needed --noconfirm "${pkgs[@]}"
+  fi
+
+  # 3. identity + new default configs for the user (never overwrite theirs)
+  cmd_brand
+  if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
+    u=$SUDO_USER; home=$(getent passwd "$u" | cut -d: -f6)
+    (cd /etc/skel && find . -type f) | while read -r f; do
+      if [[ ! -e $home/$f ]]; then
+        install -D -o "$u" -g "$u" -m 644 "/etc/skel/$f" "$home/$f"; echo "  new config: ~/${f#./}"
+      fi
+    done
+  fi
+
+  echo "$new" > /etc/kidos/version
+  post=$(snap create --type post --pre-number "$pre" --print-number --cleanup-algorithm number --description "kidos update ${new:0:7}")
+  echo
+  echo "${G}KidOS updated${N} (${new:0:7}). Snapshots $pre..$post — undo with: kidos rollback $pre"
+  echo "Reload the desktop with Super+Shift+R (reboot if the kernel was updated)."
+}
+
 # ------------------------------------------------------------ main
 cmd=${1:-help}; shift || true
 case $cmd in
   help|-h|--help) usage; exit 0 ;;
   version|--version) echo "kidos $VERSION"; exit 0 ;;
+  ask) exec kidos-ask "$@" ;;          # runs as the normal user
 esac
 [[ $EUID -eq 0 ]] || exec sudo -- "$0" "$cmd" "$@"
 command -v snapper >/dev/null || die "snapper not installed"
+# every branch ends in exit: kidos update replaces this file while it runs
 case $cmd in
-  status|st)  cmd_status "$@" ;;
-  commit|ci)  cmd_commit "$@" ;;
-  log)        cmd_log "$@" ;;
-  show)       cmd_show "$@" ;;
-  diff)       cmd_diff "$@" ;;
-  tag)        cmd_tag "$@" ;;
-  restore)    cmd_restore "$@" ;;
-  rollback)   cmd_rollback "$@" ;;
-  gc)         cmd_gc "$@" ;;
+  status|st)  cmd_status "$@"; exit ;;
+  commit|ci)  cmd_commit "$@"; exit ;;
+  log)        cmd_log "$@"; exit ;;
+  show)       cmd_show "$@"; exit ;;
+  diff)       cmd_diff "$@"; exit ;;
+  tag)        cmd_tag "$@"; exit ;;
+  restore)    cmd_restore "$@"; exit ;;
+  rollback)   cmd_rollback "$@"; exit ;;
+  gc)         cmd_gc "$@"; exit ;;
+  update|up)  cmd_update "$@"; exit ;;
+  brand)      cmd_brand "$@"; exit ;;
+  _hook)      cmd_hook "$@"; exit ;;
+  _snap)      cmd_snap "$@"; exit ;;
   *) usage; die "unknown command: $cmd" ;;
 esac
