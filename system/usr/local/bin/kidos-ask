@@ -3,6 +3,7 @@
 #
 #   kidos ask "install a browser"      one task
 #   kidos ask                          chat mode
+#   kidos ask -c                       continue the last conversation
 #   kidos ask --setup                  pick provider + API key
 #
 # The model proposes shell commands; you approve each one (read-only commands
@@ -54,13 +55,21 @@ setup() {
 # Read-only commands run without asking. Anything else needs a "y".
 is_safe() {
   local cmd=$1 seg w rest
-  [[ $cmd == *[\;\&\>\<\`]* || $cmd == *'$('* || $cmd == *$'\n'* ]] && return 1
-  IFS='|' read -ra segs <<<"$cmd"
+  # harmless redirects don't make a command unsafe
+  cmd=${cmd//2>\/dev\/null/}; cmd=${cmd//2>&1/}; cmd=${cmd//>\/dev\/null/}
+  [[ $cmd == *[\>\<\`]* || $cmd == *'$('* || $cmd == *$'\n'* ]] && return 1
+  # split on ; && || | into simple commands; each must be read-only
+  local flat=${cmd//&&/;}; flat=${flat//||/;}; flat=${flat//|/;}
+  [[ $flat == *'&'* ]] && return 1          # background jobs
+  IFS=';' read -ra segs <<<"$flat"
   for seg in "${segs[@]}"; do
+    [[ -z ${seg//[[:space:]]/} ]] && continue
     read -r w rest <<<"$seg"
     case $w in
-      ls|cat|head|tail|grep|free|df|du|uname|uptime|whoami|id|hostname|lsblk|lscpu|lspci|lsusb|\
+      ls|cat|head|tail|grep|free|df|du|uname|uptime|whoami|id|hostname|lsblk|basename|dirname|printf|true|nproc|readlink|realpath|column|lscpu|lspci|lsusb|\
       ps|pgrep|date|which|file|stat|wc|sort|uniq|echo|fastfetch|ip|sensors|journalctl|awk|cut|tr) ;;
+      xargs)     [[ $rest =~ ^(-[a-z0-9]+ )*(basename|dirname|ls|cat|wc|echo|file|stat)( |$) ]] || return 1 ;;
+      env)       [[ -z ${rest//[[:space:]]/} ]] || return 1 ;;
       pacman)    [[ $rest =~ ^-(Q|Ss|Si|F)[a-z]*( |$) ]] || return 1 ;;
       systemctl) [[ $rest =~ ^(--user\ )?(status|is-active|is-enabled|is-failed|list-units|list-unit-files|--failed|show)( |$) ]] || return 1 ;;
       nmcli)     [[ $rest =~ (connect|delete|modify|up|down|add|radio|off|on|disconnect|reload) ]] && return 1 ;;
@@ -134,6 +143,7 @@ add_results() { # JSON array of {id,out}
 }
 
 # ------------------------------------------------------------ running commands
+ALLOW_ALL=''
 PRE=''   # snapshot number taken before the first approved change
 QUESTION=''
 
@@ -147,7 +157,6 @@ snapshot_post() {
     echo "${D}kidos: session saved as snapshots $PRE+ — undo everything with: kidos rollback $PRE${N}"
   PRE=''
 }
-trap snapshot_post EXIT
 
 run_one() { # command reason -> sets OUT
   local cmd=$1 reason=$2 a="" tmp rc
@@ -155,8 +164,11 @@ run_one() { # command reason -> sets OUT
   if is_safe "$cmd"; then
     printf '  %s(read-only, running)%s\n' "$D" "$N"
   else
-    read -rp "  run it? [y/N/e=edit] " a </dev/tty 2>/dev/null || a=""
+    if [[ -n $ALLOW_ALL ]]; then a=y
+    elif [[ -r /dev/tty ]]; then read -rp "  run it? ${B}[y]${N}es / ${B}[n]${N}o / ${B}[a]${N}ll this session / ${B}[e]${N}dit: " a </dev/tty
+    else a=""; fi
     case $a in
+      a|A) ALLOW_ALL=1 ;;
       e|E) read -rei "$cmd" -p "  \$ " cmd </dev/tty ;;
       y|Y|yes) ;;
       *) OUT="The user declined to run this command."; echo "  ${D}skipped${N}"; return ;;
@@ -213,16 +225,43 @@ Desktop: Sway (Wayland, Xwayland off by default), terminal foot, launcher fuzzel
 The root filesystem is btrfs; the whole OS is versioned by the 'kidos' CLI (kidos log/diff/show/rollback/restore). This session is snapshotted, so changes can be undone.
 You act only through the run_command tool; the user approves each command.
 Rules: commands must be non-interactive (pacman --noconfirm, systemctl --no-pager, no editors or pagers). Keep output small (head, tail, grep). Check before changing things. Prefer small, light packages; this OS targets old hardware.
-Style: short and plain. No filler. When finished, give a 1-3 line summary of what changed.
-Machine: $(hostname), kernel $(uname -r), RAM used $(free -h | awk '/^Mem/{print $3" of "$2}'), disk / $(df -h / | awk 'NR==2{print $3" of "$2}'), user $USER."
+Style: plain text for a terminal. No markdown (no **, #, backticks or tables). Short and direct, no filler.
+Read-only checks usually run automatically, so just run them instead of asking. If the user declines a command, briefly offer an alternative or stop.
+When finished, give a 1-3 line answer or summary.
+Machine: $(uname -n), kernel $(uname -r), RAM used $(free -h | awk '/^Mem/{print $3" of "$2}'), disk / $(df -h / | awk 'NR==2{print $3" of "$2}'), user $USER."
 
-if (($#)); then
-  ask_once "$*"
-else
-  echo "${B}kidos ask${N} ${D}($ASK_MODEL) — empty line or 'exit' to quit${N}"
+# ------------------------------------------------------------ session
+STATE_DIR=${XDG_STATE_HOME:-$HOME/.local/state}/kidos
+SESSION=$STATE_DIR/ask-session.json
+save_session() { mkdir -p "$STATE_DIR"; jq -n --argjson m "$MSGS" --arg q "$QUESTION" --arg f "$ASK_FORMAT" \
+  '{format:$f, question:$q, messages:$m}' > "$SESSION" 2>/dev/null; }
+trap 'save_session; snapshot_post' EXIT
+
+case ${1:-} in
+  -c|--continue)
+    shift
+    if [[ -f $SESSION ]] && [[ $(jq -r .format "$SESSION") == "$ASK_FORMAT" ]]; then
+      MSGS=$(jq -c .messages "$SESSION"); QUESTION=$(jq -r .question "$SESSION")
+      echo "${D}continuing: ${QUESTION}${N}"
+    else
+      echo "${D}no previous session, starting a new one${N}"
+    fi ;;
+  -n|--new) shift ;;
+esac
+
+chat() {
+  echo "${D}follow up, or press Enter on an empty line to quit  (resume later: kidos ask -c)${N}"
   while read -rep "${C}ask ›${N} " q; do
     [[ -z $q || $q == exit || $q == quit ]] && break
     history -s "$q"
     ask_once "$q"
   done
+}
+
+if (($#)); then
+  ask_once "$*"
+  [[ -t 0 ]] && { echo; chat; }    # stay in the session for follow-ups
+else
+  echo "${B}kidos ask${N} ${D}($ASK_MODEL)${N}"
+  chat
 fi

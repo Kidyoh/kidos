@@ -327,6 +327,11 @@ cmd_update() {
   cmd_brand
   if [[ -n ${SUDO_USER:-} && $SUDO_USER != root ]]; then
     u=$SUDO_USER; home=$(getent passwd "$u" | cut -d: -f6)
+    # migrate: drop old per-user bindings that now live in /etc/sway/config.d/50-kidos.conf
+    local sc="$home/.config/sway/config"
+    if [[ -f $sc ]] && grep -qE '^bindsym (\$mod\+Shift\+s|Print) +exec grim' "$sc"; then
+      sed -i -E '/^bindsym (\$mod\+Shift\+s|Print) +exec grim/d' "$sc"; echo "  migrated: ~/.config/sway/config (screenshot keys)"
+    fi
     (cd /etc/skel && find . -type f) | while read -r f; do
       if [[ ! -e $home/$f ]]; then
         install -D -o "$u" -g "$u" -m 644 "/etc/skel/$f" "$home/$f"; echo "  new config: ~/${f#./}"
